@@ -9,12 +9,11 @@ from zoneinfo import ZoneInfo
 
 # ---------------- Config básica ----------------
 st.set_page_config(page_title="CalCalculator", page_icon="🍎", layout="centered")
-
 TZ = ZoneInfo("America/Argentina/Cordoba")
 
-# Nombre del Spreadsheet (o ID si lo agregás a secrets)
+# Leer configuración desde Secrets
 SHEET_TITLE = st.secrets.get("SHEET_TITLE", "CalCalculator")
-SHEET_ID = st.secrets.get("SHEET_ID", None)  # opcional: si lo ponés, abre por ID
+SHEET_ID = st.secrets.get("SHEET_ID", None)  # opcional: si existe, abre por ID
 
 # Columnas esperadas
 FOODS_HEADERS = [
@@ -22,6 +21,26 @@ FOODS_HEADERS = [
     "kcal_per_100g", "kcal_serving", "serving_grams", "created_at"
 ]
 ENTRIES_HEADERS = ["id", "food_id", "ts_utc", "grams", "servings", "kcal_total"]
+
+
+# ---------------- Helpers de hashing para cache ----------------
+# Streamlit necesita hashear parámetros. Los Worksheet de gspread no son hashables.
+# Le damos un hash estable usando (spreadsheet_id, title, sheetId).
+def _hash_ws(ws: "gspread.worksheet.Worksheet") -> str:
+    try:
+        spr_id = ws.spreadsheet.id
+    except Exception:
+        spr_id = "unknown"
+    try:
+        title = ws.title
+    except Exception:
+        title = "unknown"
+    try:
+        sheet_id = getattr(ws, "_properties", {}).get("sheetId")
+    except Exception:
+        sheet_id = None
+    return f"{spr_id}:{title}:{sheet_id}"
+
 
 # ---------------- Conexión a Google Sheets ----------------
 @st.cache_resource
@@ -42,17 +61,16 @@ def get_gc_and_ws():
         try:
             sh = gc.open(SHEET_TITLE)
         except gspread.SpreadsheetNotFound:
-            # Si no existe y tu SA tiene permisos, lo crea
+            # Si no existe y la SA tiene permisos, lo crea (quedará en el Drive de la SA)
             sh = gc.create(SHEET_TITLE)
 
-    # Asegurar worksheets y encabezados
     def ensure_ws(name, headers):
         try:
             ws = sh.worksheet(name)
         except gspread.WorksheetNotFound:
             ws = sh.add_worksheet(name, rows=1000, cols=20)
             ws.update("A1", [headers])
-        # Si la primera fila no coincide, reescribimos encabezados
+        # Si la primera fila no coincide, reseteamos encabezados
         first_row = ws.row_values(1)
         if first_row != headers:
             ws.clear()
@@ -61,30 +79,34 @@ def get_gc_and_ws():
 
     ws_foods = ensure_ws("foods", FOODS_HEADERS)
     ws_entries = ensure_ws("entries", ENTRIES_HEADERS)
-
     return gc, ws_foods, ws_entries
+
 
 gc, ws_foods, ws_entries = get_gc_and_ws()
 
+
 # ---------------- Utilidades de Sheets ----------------
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=15, hash_funcs={gspread.worksheet.Worksheet: _hash_ws})
 def read_df(ws, headers):
-    recs = ws.get_all_records()
-    df = pd.DataFrame(recs)
+    records = ws.get_all_records()
+    df = pd.DataFrame(records)
     if df.empty:
         return pd.DataFrame(columns=headers)
 
     # Tipado suave
-    num_cols = {"id", "food_id", "kcal_per_100g", "kcal_serving", "serving_grams", "grams", "servings", "kcal_total"}
+    num_cols = {"id", "food_id", "kcal_per_100g", "kcal_serving", "serving_grams",
+                "grams", "servings", "kcal_total"}
     for c in df.columns:
         if c in num_cols:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
+
 def write_df(ws, df):
     # Reescribe por completo la hoja con encabezados + datos
     headers = ws.row_values(1)
     if not headers:
+        # fallback por título
         headers = FOODS_HEADERS if ws.title == "foods" else ENTRIES_HEADERS
 
     if df is None or df.empty:
@@ -97,14 +119,17 @@ def write_df(ws, df):
     ws.clear()
     ws.update("A1", values)
 
+
 def next_id(df):
     if df.empty or "id" not in df.columns:
         return 1
     m = pd.to_numeric(df["id"], errors="coerce").max()
     return int(m) + 1 if pd.notna(m) else 1
 
+
 def refresh_cache():
     read_df.clear()
+
 
 # ---------------- Open Food Facts ----------------
 def fetch_off_by_barcode(barcode: str):
@@ -147,6 +172,7 @@ def fetch_off_by_barcode(barcode: str):
     except Exception:
         return None
 
+
 # ---------------- Dominio ----------------
 def upsert_food(food_dict):
     """Inserta/actualiza alimento por barcode (si viene). Para caseros, barcode puede ser ""."""
@@ -186,6 +212,7 @@ def upsert_food(food_dict):
     refresh_cache()
     return food_id
 
+
 def add_entry(food_id, grams=None, servings=None, kcal_total=None):
     entries = read_df(ws_entries, ENTRIES_HEADERS).copy()
     entry_id = next_id(entries)
@@ -203,8 +230,8 @@ def add_entry(food_id, grams=None, servings=None, kcal_total=None):
     refresh_cache()
     return entry_id
 
+
 def kcal_from(food_row_or_dict, grams=None, servings=None):
-    # food_row_or_dict puede venir como dict (OFF) o fila de foods
     kcal_100 = food_row_or_dict.get("kcal_per_100g")
     kcal_serv = food_row_or_dict.get("kcal_serving")
     if grams and pd.notna(kcal_100):
@@ -214,6 +241,7 @@ def kcal_from(food_row_or_dict, grams=None, servings=None):
     if grams and pd.notna(kcal_100):
         return (float(kcal_100) * float(grams)) / 100.0
     return None
+
 
 def today_entries_df():
     foods = read_df(ws_foods, FOODS_HEADERS)
@@ -242,6 +270,7 @@ def today_entries_df():
         "kcal": merged["kcal_total"],
     })
     return rows
+
 
 # ---------------- UI ----------------
 st.title("🍎 CalCalculator")
@@ -338,4 +367,4 @@ with tab3:
                            "consumos_hoy.csv", "text/csv")
 
 st.divider()
-st.caption("Tip: En web, el escaneo con cámara se puede sumar luego con un componente JS (QuaggaJS/ZXing).")
+st.caption("Tip: en web, el escaneo con cámara se puede sumar luego con un componente JS (QuaggaJS/ZXing).")
